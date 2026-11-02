@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Image Index</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font-family: system-ui, sans-serif;
+    background: #17191d;
+    color: #e5e7eb;
+  }
+
+  * { box-sizing: border-box; }
+
+  body { margin: 0; }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #202329;
+    border-bottom: 1px solid #383c45;
+    padding: 16px 20px;
+  }
+
+  h1 { margin: 0 0 12px; font-size: 1.35rem; }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  input, select {
+    background: #30343c;
+    color: inherit;
+    border: 1px solid #505662;
+    border-radius: 6px;
+    padding: 9px 11px;
+    font: inherit;
+  }
+
+  #search { flex: 1; min-width: 220px; }
+
+  #status {
+    color: #aab0bb;
+    font-size: .85rem;
+    margin-top: 10px;
+  }
+
+  #tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 12px;
+    max-height: 10vh;
+    overflow: auto;
+  }
+
+  .tag {
+    border: 1px solid #555d6b;
+    border-radius: 20px;
+    padding: 3px 9px;
+    font-size: .78rem;
+    cursor: pointer;
+    background: #30343c;
+    color: #d5d9e0;
+  }
+
+  .tag.active {
+    background: #315b87;
+    border-color: #609bd4;
+    color: white;
+  }
+
+  main { padding: 18px; }
+
+  #gallery {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 14px;
+  }
+
+  .card {
+    min-width: 0;
+    background: #24272e;
+    border: 1px solid #383c45;
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+  }
+
+  .card:hover { border-color: #7ca9d5; }
+
+  .card img {
+    display: block;
+    width: 100%;
+    height: 165px;
+    object-fit: contain;
+    background: #111318;
+  }
+
+  .card-info { padding: 9px 10px 11px; }
+
+  .filename {
+    font-size: .85rem;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+
+  .description {
+    color: #b6bdc8;
+    font-size: .78rem;
+    margin-top: 5px;
+    line-height: 1.4;
+  }
+
+  .date {
+    color: #858d9b;
+    font-size: .72rem;
+    margin-top: 7px;
+  }
+
+  #empty {
+    color: #aab0bb;
+    padding: 40px 10px;
+    text-align: center;
+  }
+
+  dialog {
+    width: min(950px, 95vw);
+    max-height: 92vh;
+    overflow: auto;
+    background: #24272e;
+    color: inherit;
+    border: 1px solid #555d6b;
+    border-radius: 10px;
+    padding: 18px;
+  }
+
+  dialog::backdrop { background: #000b; }
+
+  #detail-image {
+    display: block;
+    max-width: 100%;
+    max-height: 55vh;
+    margin: 0 auto 18px;
+    object-fit: contain;
+  }
+
+  #detail h2 { font-size: 1.1rem; overflow-wrap: anywhere; }
+  #detail h3 { font-size: .9rem; margin-bottom: 5px; }
+  #detail p { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #detail pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  .detail-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .detail-tags span {
+    background: #343b47;
+    border-radius: 14px;
+    padding: 4px 9px;
+    font-size: .8rem;
+  }
+
+  .dialog-actions {
+    position: sticky;
+    top: 0;
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 10px;
+  }
+
+  button {
+    background: #394352;
+    color: white;
+    border: 1px solid #59677b;
+    border-radius: 6px;
+    padding: 7px 12px;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Image Index</h1>
+
+  <div class="controls">
+    <input id="search" type="search"
+           placeholder="Search descriptions, OCR, filenames, tags…">
+
+    <select id="type">
+      <option value="">All image types</option>
+    </select>
+
+    <select id="sort">
+      <option value="newest">Newest first</option>
+      <option value="oldest">Oldest first</option>
+      <option value="name">Filename</option>
+    </select>
+  </div>
+
+  <div id="status">Loading index…</div>
+  <div id="tags"></div>
+</header>
+
+<main>
+  <div id="gallery"></div>
+  <div id="empty" hidden>No matching images.</div>
+</main>
+
+<dialog id="detail" closedby="any">
+  <div class="dialog-actions">
+    <button id="close-detail">Close (Esc)</button>
+  </div>
+  <img id="detail-image" alt="">
+  <div id="detail-content"></div>
+</dialog>
+
+<script>
+"use strict";
+
+const INDEX_URL = "./image_index.ndjson";
+
+let records = [];
+let activeTags = new Set();
+
+const $ = id => document.getElementById(id);
+
+function text(value) {
+  if (value == null) return "";
+  if (Array.isArray(value)) return value.map(text).join(" ");
+  if (typeof value === "object") return Object.values(value).map(text).join(" ");
+  return String(value);
+}
+
+function analysis(record) {
+  return record.analysis && typeof record.analysis === "object"
+    ? record.analysis : {};
+}
+
+function tagsFor(record) {
+  const a = analysis(record);
+  const values = [
+    ...(Array.isArray(a.topics) ? a.topics : []),
+    ...(Array.isArray(a.tags) ? a.tags : []),
+    ...(Array.isArray(a.suggested_tags) ? a.suggested_tags : []),
+    ...(Array.isArray(a.visual_style) ? a.visual_style : []),
+    ...(Array.isArray(a.language) ? a.language : [])
+  ];
+
+  return [...new Set(values.map(text).filter(Boolean))];
+}
+
+function imageType(record) {
+  return text(analysis(record).image_type || "unknown");
+}
+
+// Search only over human-meaningful fields (not hashes, sizes, raw model
+// output, etc.). Cached per record so typing stays fast.
+const searchCache = new WeakMap();
+
+function searchableText(record) {
+  let cached = searchCache.get(record);
+  if (cached === undefined) {
+    const a = analysis(record);
+    cached = [
+      record.filename, record.path,
+      a.description, a.topics, a.keywords, a.search_terms,
+      a.visible_text, a.content_type, a.image_type,
+      a.language, a.visual_style
+    ].map(text).join(" \n ").toLocaleLowerCase();
+    searchCache.set(record, cached);
+  }
+  return cached;
+}
+
+function imageUrl(record) {
+  const path = text(record.path || record.filename).replaceAll("\\", "/");
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  return new URL(encoded, document.baseURI).href;
+}
+
+function dateValue(record) {
+  const value = record.modified_at || record.indexed_at || "";
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? date : 0;
+}
+
+function formatDate(record) {
+  const value = record.modified_at || record.indexed_at;
+  if (!value) return "Date unknown";
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "Date unknown"
+    : date.toLocaleString();
+}
+
+async function loadIndex() {
+  try {
+    const response = await fetch(INDEX_URL, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const content = await response.text();
+    const lines = content.split(/\r?\n/);
+    let malformed = 0;
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+
+      try {
+        const record = JSON.parse(line);
+        if (record && typeof record === "object") {
+          records.push(record);
+        } else {
+          malformed++;
+        }
+      } catch {
+        malformed++;
+      }
+    }
+
+    populateTypes();
+    render();
+
+    $("status").textContent =
+      `${records.length} images` +
+      (malformed ? ` · ${malformed} invalid lines skipped` : "");
+
+  } catch (error) {
+    $("status").textContent = `Could not load ${INDEX_URL}: ${error.message}`;
+  }
+}
+
+function populateTypes() {
+  const types = [...new Set(records.map(imageType))].sort();
+  const select = $("type");
+
+  for (const type of types) {
+    const option = document.createElement("option");
+    option.value = type;
+    option.textContent = type;
+    select.append(option);
+  }
+}
+
+function renderTags() {
+  const counts = new Map();
+
+  for (const record of records) {
+    for (const tag of new Set(tagsFor(record))) {
+      counts.set(tag, (counts.get(tag) || 0) + 1);
+    }
+  }
+
+  const container = $("tags");
+  container.replaceChildren();
+
+  const sorted = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+
+  for (const [tag, count] of sorted) {
+    const button = document.createElement("button");
+    button.className = "tag" + (activeTags.has(tag) ? " active" : "");
+    button.textContent = `${tag} (${count})`;
+    button.title = "Toggle tag filter";
+
+    button.addEventListener("click", e => {
+      if (activeTags.has(tag)) {
+        activeTags.delete(tag);
+      } else {
+        if (!e.shiftKey) activeTags.clear();
+        activeTags.add(tag);
+      }
+      render();
+    });
+
+    container.append(button);
+  }
+}
+
+function filteredRecords() {
+  const query = $("search").value.trim().toLocaleLowerCase();
+  const type = $("type").value;
+  const terms = query.split(/\s+/).filter(Boolean);
+
+  let result = records.filter(record => {
+    if (type && imageType(record) !== type) return false;
+
+    const recordTags = tagsFor(record);
+    if (![...activeTags].every(tag => recordTags.includes(tag))) {
+      return false;
+    }
+
+    // Every whitespace-separated word must match somewhere (AND search).
+    if (terms.length) {
+      const haystack = searchableText(record);
+      if (!terms.every(term => haystack.includes(term))) return false;
+    }
+
+    return true;
+  });
+
+  const sort = $("sort").value;
+
+  result.sort((a, b) => {
+    if (sort === "name") {
+      return text(a.filename || a.path)
+        .localeCompare(text(b.filename || b.path));
+    }
+
+    return sort === "oldest"
+      ? dateValue(a) - dateValue(b)
+      : dateValue(b) - dateValue(a);
+  });
+
+  return result;
+}
+
+function render() {
+  renderTags();
+
+  const result = filteredRecords();
+  const gallery = $("gallery");
+  gallery.replaceChildren();
+
+  $("empty").hidden = result.length !== 0;
+
+  for (const record of result) {
+    const card = document.createElement("article");
+    card.className = "card";
+
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.src = imageUrl(record);
+    img.alt = text(record.filename || record.path);
+    img.onerror = () => {
+      img.alt = "Image could not be loaded";
+      img.removeAttribute("src");
+    };
+
+    const info = document.createElement("div");
+    info.className = "card-info";
+
+    const filename = document.createElement("div");
+    filename.className = "filename";
+    filename.textContent = text(record.filename || record.path || "Unnamed");
+
+    const description = document.createElement("div");
+    description.className = "description";
+    description.textContent = text(analysis(record).description);
+
+    const date = document.createElement("div");
+    date.className = "date";
+    date.textContent = formatDate(record);
+
+    info.append(filename, description, date);
+    card.append(img, info);
+    card.addEventListener("click", () => showDetail(record));
+    gallery.append(card);
+  }
+
+  $("status").textContent =
+    `${result.length} of ${records.length} images` +
+    (activeTags.size ? ` · ${activeTags.size} tag filters` : "");
+}
+
+function addDetailSection(parent, heading, value) {
+  if (value == null || value === "") return;
+
+  const section = document.createElement("section");
+  const title = document.createElement("h3");
+  title.textContent = heading;
+
+  const content = document.createElement("p");
+  content.textContent = text(value);
+
+  section.append(title, content);
+  parent.append(section);
+}
+
+function showDetail(record) {
+  const a = analysis(record);
+  const dialog = $("detail");
+  const content = $("detail-content");
+
+  $("detail-image").src = imageUrl(record);
+  $("detail-image").alt = text(record.filename || record.path);
+  content.replaceChildren();
+
+  const title = document.createElement("h2");
+  title.textContent = text(record.filename || record.path);
+  content.append(title);
+
+  if (record.analysis_error) {
+    addDetailSection(content, "Analysis failed", record.analysis_error);
+  }
+  if (record.truncated) {
+    addDetailSection(content, "Note",
+      "The model output was cut off and repaired; some fields may be incomplete.");
+  }
+
+  addDetailSection(content, "Description", a.description);
+  addDetailSection(content, "Keywords", a.keywords);
+  addDetailSection(content, "Search terms", a.search_terms);
+  addDetailSection(content, "Visible text / OCR", a.visible_text);
+  addDetailSection(content, "Image type", a.image_type);
+  addDetailSection(content, "Content type", a.content_type);
+  addDetailSection(content, "Language", a.language);
+  addDetailSection(content, "Visual style", a.visual_style);
+  addDetailSection(content, "Likely generated", a.likely_generated);
+  addDetailSection(content, "Confidence", a.confidence);
+  addDetailSection(content, "Path", record.path);
+  addDetailSection(content, "Modified", record.modified_at);
+  addDetailSection(content, "File size", record.file_size);
+  addDetailSection(content, "Dimensions",
+    record.width && record.height
+      ? `${record.width} × ${record.height}` : "");
+
+  const tags = tagsFor(record);
+  if (tags.length) {
+    const heading = document.createElement("h3");
+    heading.textContent = "Tags";
+
+    const container = document.createElement("div");
+    container.className = "detail-tags";
+
+    for (const tag of tags) {
+      const span = document.createElement("span");
+      span.textContent = tag;
+      container.append(span);
+    }
+
+    content.append(heading, container);
+  }
+
+  dialog.showModal();
+}
+
+$("search").addEventListener("input", render);
+$("type").addEventListener("change", render);
+$("sort").addEventListener("change", render);
+$("close-detail").addEventListener("click", () => $("detail").close());
+
+document.addEventListener("keydown", event => {
+  if (event.key === "/" &&
+      !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) {
+    event.preventDefault();
+    $("search").focus();
+  }
+
+  if (event.key === "Escape" && $("detail").open) {
+    $("detail").close();
+  }
+});
+
+loadIndex();
+</script>
+</body>
+</html>
