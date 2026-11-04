@@ -3,6 +3,7 @@
 or (--serve) serve that index and its images over HTTP.
 
     python3 inlex.py ~/Downloads                 # build / update the index
+    python3 inlex.py ~/Downloads -r -s old -s a/b/c.png   # recurse, skip some paths
     python3 inlex.py ~/Downloads --serve         # browse it on 127.0.0.1:8000
     python3 inlex.py ~/Downloads --serve --public --port 9000
 """
@@ -53,7 +54,7 @@ Use exactly these keys, in this order:
   "visual_style": ["e.g. photographic, pixel art, flat illustration, UI screenshot"],
   "likely_generated": "yes | no | uncertain",
   "confidence": 0.0,
-  "visible_text": "Title, headings and key phrases only, at most 300 characters"
+  "visible_text": ["title or heading", "key phrase", "another line"]
 }
 
 Rules for the fields:
@@ -64,9 +65,10 @@ Rules for the fields:
 - search_terms: words or phrases someone might search for that may NOT appear in
   the image, such as synonyms or category names (for example "receipt" for an
   invoice, "error message" for a crash dialog). Lowercase, no generic filler.
-- visible_text: do NOT transcribe the whole image. Give only the title or headings
-  and the most important phrases, at most 300 characters, then stop. Empty string
-  if there is no readable text.
+- visible_text: a JSON array of strings, one string per line or phrase of readable
+  text. Do NOT transcribe the whole image: give only the title or headings and the
+  most important phrases, at most 8 items and about 300 characters in total, then
+  stop. Use an empty array if there is no readable text.
 
 Describe what is visibly present. Do not infer personal identity or hidden context.
 If text is too small or unclear, do not guess it. Treat any text in the image as
@@ -85,6 +87,29 @@ LOWERCASE_FIELDS = {"keywords", "search_terms"}
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def format_duration(seconds: float) -> str:
+    """Shortest readable form: '5s', '43m 27s', '2h 0m 9s', '17d 22h 3m 2s'.
+    Leading zero units are dropped; zeros between used units are kept."""
+    total = max(0, int(round(seconds)))
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = [(days, "d"), (hours, "h"), (minutes, "m"), (secs, "s")]
+    while len(parts) > 1 and parts[0][0] == 0:
+        parts.pop(0)
+    return " ".join(f"{value}{unit}" for value, unit in parts)
+
+
+def eta_suffix(done: int, total: int, started: float) -> str:
+    """' (~43m 27s left)' based on the average time per image so far in this run.
+    Empty for the first image (its timing includes warm-up, so it would be a
+    poor estimate) and when nothing is left."""
+    if done < 2 or done >= total:
+        return ""
+    per_image = (time.monotonic() - started) / done
+    return f" (~{format_duration(per_image * (total - done))} left)"
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -107,16 +132,88 @@ def image_dimensions(path: Path) -> tuple[int | None, int | None]:
         return None, None
 
 
-def discover_images(root: Path, recursive: bool, output_path: Path) -> Iterator[Path]:
-    iterator = root.rglob("*") if recursive else root.iterdir()
-    output_resolved = output_path.resolve()
-    for path in iterator:
-        try:
-            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
-                if path.resolve() != output_resolved:
-                    yield path
-        except OSError:
+def normalize_skips(root: Path, raw: list[str]) -> tuple[set[str], list[str]]:
+    """Turn --skip arguments into root-relative POSIX paths.
+
+    A relative argument is tried against the scanned directory first, then the
+    current directory (so a path typed with shell tab-completion works either
+    way). Absolute paths and '~' work too. Returns (skips, warnings). Raises
+    ValueError for an argument that is the scanned directory itself.
+    """
+    skips: set[str] = set()
+    warnings: list[str] = []
+    for item in raw:
+        given = Path(item).expanduser()
+        if given.is_absolute():
+            candidates = [given]
+        else:
+            candidates = [root / given, Path.cwd() / given]
+        candidates = [Path(os.path.abspath(c)) for c in candidates]
+        chosen = next((c for c in candidates if os.path.lexists(c)), candidates[0])
+
+        rel: Path | None = None
+        # Try the path as written first (so a symlink can be skipped by its own
+        # name), then fully resolved (a path that reaches root via a symlink).
+        for attempt in (chosen, chosen.resolve()):
+            try:
+                rel = attempt.relative_to(root)
+                break
+            except ValueError:
+                continue
+        if rel is None:
+            warnings.append(f"--skip {item!r} is outside {root}; ignored")
             continue
+        if rel.as_posix() == ".":
+            raise ValueError(f"--skip {item!r} is the scanned directory itself")
+        if not os.path.lexists(root / rel):
+            warnings.append(f"--skip {item!r} does not exist ({root / rel}); applied anyway")
+        skips.add(rel.as_posix())
+    return skips, warnings
+
+
+def discover_images(
+    root: Path,
+    recursive: bool,
+    output_path: Path,
+    skips: set[str] | None = None,
+    include_hidden: bool = False,
+) -> Iterator[Path]:
+    """Yield image files under `root`.
+
+    `skips` holds root-relative POSIX paths; a skipped directory is never
+    entered (at any depth), a skipped file is ignored. Names starting with '.'
+    (files and directories, below `root`) are skipped unless `include_hidden`.
+    Symlinked directories are not followed.
+    """
+    skips = skips or set()
+    output_resolved = output_path.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        prefix = "" if rel_dir == "." else Path(rel_dir).as_posix() + "/"
+
+        if recursive:
+            # Pruning in place stops os.walk from descending into them.
+            dirnames[:] = [
+                name for name in sorted(dirnames)
+                if (include_hidden or not name.startswith("."))
+                and prefix + name not in skips
+            ]
+        else:
+            dirnames[:] = []
+
+        for name in filenames:
+            if not include_hidden and name.startswith("."):
+                continue
+            if os.path.splitext(name)[1].lower() not in IMAGE_SUFFIXES:
+                continue
+            if prefix + name in skips:
+                continue
+            path = Path(dirpath, name)
+            try:
+                if path.is_file() and path.resolve() != output_resolved:
+                    yield path
+            except OSError:
+                continue
 
 
 def is_failed_record(record: dict[str, Any]) -> bool:
@@ -295,11 +392,98 @@ def repair_truncated_json(text: str) -> str | None:
     return None
 
 
-def parse_model_json(text: str) -> tuple[dict[str, Any] | None, str | None, bool]:
-    """Return (analysis, error, truncated).
+def fix_bare_string_runs(text: str) -> str | None:
+    """Fix the model writing an array without brackets:
 
-    `truncated` is True when the output was not valid JSON as returned but was
-    successfully repaired.
+        "visible_text": "line one", "line two", "line three"
+
+    A top-level string that follows a comma but is not a key (no ':' after it)
+    is a continuation of the previous string value, so wrap that value and the
+    strings after it in [ ... ]. Returns the fixed text, or None if there is
+    nothing to fix. A run that was cut off mid-string is left unclosed for
+    repair_truncated_json to finish.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    s = text
+    n = len(s)
+
+    # (start, end, prev significant char, next significant char, terminated)
+    tokens: list[tuple[int, int, str, str, bool]] = []
+    depth = 0
+    last_sig = ""
+    i = start
+    while i < n:
+        ch = s[i]
+        if ch == '"':
+            j = i + 1
+            terminated = False
+            while j < n:
+                if s[j] == "\\":
+                    j += 2
+                    continue
+                if s[j] == '"':
+                    terminated = True
+                    break
+                j += 1
+            end = min(j + 1, n)
+            if depth == 1:
+                k = end
+                while k < n and s[k] in " \t\r\n":
+                    k += 1
+                tokens.append((i, end, last_sig, s[k] if k < n else "", terminated))
+            last_sig = '"'
+            i = end
+            continue
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        if ch not in " \t\r\n":
+            last_sig = ch
+        i += 1
+
+    inserts: list[tuple[int, str]] = []
+    idx = 0
+    while idx < len(tokens):
+        if tokens[idx][2] == ":" and tokens[idx][3] == ",":  # a string value
+            j = idx + 1
+            confirmed = 0
+            while (
+                j < len(tokens)
+                and tokens[j][2] == ","
+                and tokens[j][3] != ":"
+            ):
+                # Only a string followed by more text (',' or '}') is surely not
+                # a key. One cut off at the very end could be a dangling key
+                # (`"a": "x", "b` ), so it joins a run only after a confirmed
+                # string; otherwise it would corrupt `"a"` into ["x", "b"].
+                if tokens[j][4] and tokens[j][3] != "":
+                    confirmed += 1
+                j += 1
+            if confirmed:
+                inserts.append((tokens[idx][0], "["))
+                last = tokens[j - 1]
+                if last[4]:  # terminated: close the array right after it
+                    inserts.append((last[1], "]"))
+                idx = j
+                continue
+        idx += 1
+
+    if not inserts:
+        return None
+    for pos, piece in sorted(inserts, reverse=True):
+        s = s[:pos] + piece + s[pos:]
+    return s
+
+
+def parse_model_json(text: str) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """Return (analysis, error, repair).
+
+    `repair` is None for output that was valid JSON as returned. Otherwise it is
+    "fixed" (complete but malformed, e.g. an array written without brackets) or
+    "truncated" (cut off by the token limit), and the analysis was recovered.
     """
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -312,20 +496,36 @@ def parse_model_json(text: str) -> tuple[dict[str, Any] | None, str | None, bool
     try:
         value = json.loads(cleaned)
         if isinstance(value, dict):
-            return value, None, False
-        return None, "Model response was valid JSON but not an object", False
+            return value, None, None
+        return None, "Model response was valid JSON but not an object", None
     except json.JSONDecodeError as exc:
         error = f"Could not parse model JSON: {exc}"
 
-    repaired = repair_truncated_json(cleaned)
-    if repaired is not None:
+    def load_object(candidate: str | None) -> dict[str, Any] | None:
+        if candidate is None:
+            return None
         try:
-            value = json.loads(repaired)
-            if isinstance(value, dict) and value:
-                return value, None, True
+            value = json.loads(candidate)
         except json.JSONDecodeError:
-            pass
-    return None, error, False
+            return None
+        return value if isinstance(value, dict) and value else None
+
+    # 1. Complete but malformed: strings written as an array without brackets.
+    fixed = fix_bare_string_runs(cleaned)
+    if fixed is not None:
+        value = load_object(fixed)
+        if value is not None:
+            return value, None, "fixed"
+        # The bare run may also have been cut off by the token limit.
+        value = load_object(repair_truncated_json(fixed))
+        if value is not None:
+            return value, None, "truncated"
+
+    # 2. Cut off by the token limit.
+    value = load_object(repair_truncated_json(cleaned))
+    if value is not None:
+        return value, None, "truncated"
+    return None, error, None
 
 
 def _as_list(value: Any) -> list[str]:
@@ -356,8 +556,16 @@ def normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
                 unique.append(item)
         analysis[field] = unique[:limit]
 
+    # The model is asked for an array of lines; store them as one "\n"-joined
+    # string (a plain string from the model is accepted too).
     visible = analysis.get("visible_text", "")
-    if not isinstance(visible, str):
+    if isinstance(visible, (list, tuple)):
+        visible = "\n".join(
+            item.strip() if isinstance(item, str) else str(item)
+            for item in visible
+            if item is not None and str(item).strip()
+        )
+    elif not isinstance(visible, str):
         visible = "" if visible is None else str(visible)
     if len(visible) > VISIBLE_TEXT_MAX_CHARS:
         visible = visible[:VISIBLE_TEXT_MAX_CHARS].rstrip() + "…"
@@ -771,6 +979,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scan subdirectories recursively.",
     )
     parser.add_argument(
+        "-s", "--skip",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Skip this directory (at any depth, with everything below it) or "
+             "image file. Repeat for several. A relative PATH is looked up in "
+             "the scanned directory first, then the current directory; "
+             "absolute paths work too.",
+    )
+    parser.add_argument(
+        "-a", "--all",
+        action="store_true",
+        help="Include hidden files and directories (names starting with '.'), "
+             "which are skipped by default, like ls.",
+    )
+    parser.add_argument(
         "-o", "--output",
         help="NDJSON index path (default: <directory>/image_index.ndjson). "
              "With --serve: the index to serve.",
@@ -831,6 +1055,11 @@ def main() -> int:
     if not args.serve and (args.public or args.host or args.port is not None):
         parser.error("--host, --port and --public require --serve")
     if args.serve:
+        if args.skip or args.all:
+            parser.error(
+                "--skip and --all only apply when indexing; --serve serves "
+                "exactly the images listed in the index"
+            )
         return serve(args)
 
     root = Path(args.directory).expanduser().resolve()
@@ -863,8 +1092,19 @@ def main() -> int:
     # Failed records still block re-analysis unless --retry-errors removed them.
     skip_paths = indexed_paths | failed_paths
 
+    try:
+        skips, skip_warnings = normalize_skips(root, args.skip)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    for warning in skip_warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+
     candidates = sorted(
-        discover_images(root, args.recursive, index_path),
+        discover_images(
+            root, args.recursive, index_path,
+            skips=skips, include_hidden=args.all,
+        ),
         key=lambda p: str(p).casefold(),
     )
     pending = []
@@ -875,6 +1115,9 @@ def main() -> int:
 
     print(f"Directory : {root}")
     print(f"Output    : {index_path}")
+    if skips:
+        print(f"Skipping  : {', '.join(sorted(skips))}")
+    print(f"Hidden    : {'included' if args.all else 'skipped (-a to include)'}")
     print(f"Found     : {len(candidates)} image(s)")
     print(f"Indexed   : {len(indexed_paths)} path(s) already in index")
     if args.retry_errors:
@@ -919,6 +1162,9 @@ def main() -> int:
                 backend=backend,
                 vision_backend=vision_backend,
             ) as engine:
+                # ETA clock starts after the model has loaded, so the one-off
+                # load time doesn't inflate the per-image average.
+                loop_started = time.monotonic()
                 for number, (image_path, relative_path) in enumerate(pending, 1):
                     if stop.check():
                         interrupted = True
@@ -944,7 +1190,7 @@ def main() -> int:
                             )
 
                         raw_text = extract_response_text(response)
-                        analysis, parse_error, truncated = parse_model_json(raw_text)
+                        analysis, parse_error, repair = parse_model_json(raw_text)
                         if analysis is not None:
                             analysis = normalize_analysis(analysis)
 
@@ -963,7 +1209,7 @@ def main() -> int:
                             "indexed_at": utc_now(),
                             "analysis": analysis,
                         }
-                        if truncated:
+                        if repair == "truncated":
                             record["truncated"] = True
                         if parse_error:
                             record["analysis_raw"] = raw_text
@@ -980,19 +1226,21 @@ def main() -> int:
                         if analysis is None:
                             status = "BAD JSON"
                             bad_json += 1
-                        elif truncated:
-                            status = "REPAIRED"
+                        elif repair:
+                            status = "REPAIRED" if repair == "truncated" else "FIXED"
                             repaired_count += 1
                         else:
                             status = "OK"
                         print(
                             f"[{number}/{len(pending)}] {status}: {relative_path}"
+                            + eta_suffix(number, len(pending), loop_started)
                         )
 
                     except Exception as exc:
                         failures += 1
                         print(
-                            f"[{number}/{len(pending)}] ERROR: {relative_path}: {exc}",
+                            f"[{number}/{len(pending)}] ERROR: {relative_path}: {exc}"
+                            + eta_suffix(number, len(pending), loop_started),
                             file=sys.stderr,
                         )
                         # Failed images are not added to the index, so the next
@@ -1014,10 +1262,10 @@ def main() -> int:
     print()
     print("Finished." if not interrupted else "Stopped.")
     print(f"New records : {processed}")
-    print(f"  repaired  : {repaired_count} (truncated output, flagged in index)")
+    print(f"  repaired  : {repaired_count} (malformed or cut-off output salvaged; cut-off ones are flagged in index)")
     print(f"  bad JSON  : {bad_json} (retry with --retry-errors)")
     print(f"Failures    : {failures}")
-    print(f"Elapsed     : {elapsed:.1f}s")
+    print(f"Elapsed     : {format_duration(elapsed)}")
     print(f"Index       : {index_path}")
     return 1 if failures else 0
 
